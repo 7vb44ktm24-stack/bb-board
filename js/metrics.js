@@ -1,0 +1,279 @@
+// The sums, the same way the record counts them (ledger/TRACKING.md): return = profit over stakes on settled bets,
+// luck alone = root of the sum of stake squared x (price - 1), over the stakes; verdicts as scripts/what_works.py.
+// From 6 Nov 2026 the band is by match (the orchestrator's yes, the claim-check rule): the wider of that bet-by-bet band and the
+// spread of the matches' own results, since the lines of one match move together (proven.js's byMatch; luckBet keeps the old).
+
+import { isNum, sum, mean, uniq, dowOf } from './util.js';
+
+export function verdict(ret, luck, n) {
+  if (!isNum(ret) || !isNum(luck) || luck <= 0 || !n) return { word: 'too few', z: null, more: null };
+  const z = ret / luck;
+  const a = Math.abs(z);
+  const word = a >= 2 ? (z > 0 ? 'ahead' : 'behind') : a >= 1 ? (z > 0 ? 'leaning ahead' : 'leaning behind') : 'too early';
+  const more = a >= 2 ? 0 : z === 0 ? null : Math.ceil((n * 4) / (z * z) - n);
+  return { word, z, more };
+}
+
+export function wilson(w, n, zc = 1.96) {
+  if (!n) return [null, null];
+  const p = w / n, d = 1 + (zc * zc) / n;
+  const c = p + (zc * zc) / (2 * n), s = zc * Math.sqrt((p * (1 - p)) / n + (zc * zc) / (4 * n * n));
+  return [(c - s) / d, (c + s) / d];
+}
+
+// the spread of the matches' own results around the return, as one band: sqrt(sum (profit_g - R x staked_g)^2 x G/(G-1)) / staked,
+// a match its day and name (a row with neither its own); null under two matches
+function byMatch(done) {
+  const g = new Map();
+  for (const r of done) {
+    const k = r.match ? `${r.day || ''}|${r.match}` : `#${r.id}`;
+    const x = g.get(k) || [0, 0];
+    x[0] += r.profit || 0; x[1] += r.stake;
+    g.set(k, x);
+  }
+  return g;
+}
+
+// the share of a winning record's profit its best match holds (6 Nov 2026, PA's proposal 2, the user's yes in DECISIONS 9590d17:
+// the claim-check rule's one-event share); null when the record is not ahead
+export const ONE_MATCH = 1 / 3;                                   // "ahead" only when no match holds this share or more
+export function biggestShare(done, profit) {
+  if (!isNum(profit) || profit <= 0) return null;
+  let top = 0;
+  for (const [p] of byMatch(done).values()) top = Math.max(top, p);
+  return top / profit;
+}
+
+export function matchSpread(done, R, staked) {
+  const g = byMatch(done);
+  const G = g.size;
+  if (G < 2 || !staked || !isNum(R)) return null;
+  let s2 = 0;
+  for (const [p, s] of g.values()) s2 += (p - R * s) ** 2;
+  return Math.sqrt((s2 * G) / (G - 1)) / staked;
+}
+
+// where a result is final (9 Nov 2026, the orchestrator's yes): the match table (SofaScore's counts, the six leagues and since 573b218d
+// Europe), the extra leagues' "SofaScore", the NHL's "final"; anything else (ESPN's, BSD's, the NHL's scorers) is provisional
+export const FINAL_SOURCES = new Set(['match table', 'SofaScore', 'final']);
+
+// One pick a match (the user, 9 Nov 2026 00:28 UK: "One pick per game should be the default. It should be either the first pick
+// suggested or the highest overlay, always pre-game of course"; the orchestrator's spec): a match is its sport, set, match day and
+// name; a pre-game set keeps the selection with the highest overlay (ties: the first shown, then the id), a live set the first
+// sent (in play and at the break, each lane its own record). A selection split into parts (placeable) keeps every part. The choice
+// never looks at the result: a best pick that came void stays the match's pick. Sets that repeat a selection by design (`skip`)
+// and rows with no match pass as they are.
+export const LIVE_SETS = new Set(['live', 'liveblend', 'htsent', 'liveunder', 'htextra', 'h123', 'h127', 'h156', 'h157', 'h158', 'h160',
+  'h161', 'h161s', 'h162', 'h166', 'h166v', 'livesent', 'livetracked']);
+// by 'stat' (the record tabs' default since the user's correction of 9 Nov 2026 about 12:10 UK: "one pick per stat and game, e.g.
+// if two fouls overs, keep one"): the same choice within each match and stat; a match's different stats all stay
+export function onePerMatch(rows, { live = (s) => LIVE_SETS.has(s), skip = () => false, by = 'match' } = {}) {
+  const key = (r) => (r.match && !skip(r.set) ? `${r.sport}|${r.set}|${r.day || ''}|${r.match}${by === 'stat' ? `|${r.stat || ''}` : ''}` : null);
+  const sel = (r) => (r.selection != null ? `${r.day}|${r.selection}` : `#${r.id}`);
+  const cand = new Map();
+  for (const r of rows) {
+    const k = key(r);
+    if (!k) continue;
+    const m = cand.get(k) || new Map();
+    const s = sel(r);
+    const c = m.get(s) || { s, set: r.set, edge: -Infinity, shown: null, id: String(r.id) };
+    if (isNum(r.edge)) c.edge = Math.max(c.edge, r.edge);
+    if (r.shown && (!c.shown || r.shown < c.shown)) c.shown = r.shown;
+    if (String(r.id) < c.id) c.id = String(r.id);
+    m.set(s, c);
+    cand.set(k, m);
+  }
+  const first = (a, b) => (a.shown && b.shown ? (a.shown < b.shown ? -1 : a.shown > b.shown ? 1 : 0) : a.shown ? -1 : b.shown ? 1 : 0) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+  const pick = new Map();
+  for (const [k, m] of cand) {
+    const list = [...m.values()];
+    const isLive = live(list[0].set);
+    list.sort((a, b) => (isLive ? 0 : b.edge - a.edge) || first(a, b));
+    pick.set(k, list[0].s);
+  }
+  return rows.filter((r) => { const k = key(r); return !k || pick.get(k) === sel(r); });
+}
+
+// one group of bets, every number the views show
+export function agg(rows) {
+  const done = rows.filter((r) => r.settled && isNum(r.stake) && isNum(r.price));
+  const open = rows.filter((r) => r.status === 'open' || r.status === 'in play');
+  const staked = sum(done, (r) => r.stake);
+  const profit = sum(done, (r) => r.profit);
+  const varSum = sum(done, (r) => r.stake * r.stake * (r.price - 1));
+  const n = done.length;
+  const won = done.filter((r) => r.w).length;
+  const ret = staked ? profit / staked : null;
+  const luckBet = staked ? Math.sqrt(varSum) / staked : null;
+  const luckMatch = staked ? matchSpread(done, profit / staked, staked) : null;
+  const luck = staked ? Math.max(luckBet, isNum(luckMatch) ? luckMatch : 0) : null;
+  const levelRet = n ? mean(done, (r) => r.w * r.price - 1) : null;
+  const levelLuck = n ? Math.sqrt(sum(done, (r) => r.price - 1)) / n : null;
+  const v = verdict(ret, luck, n);
+  const biggest = biggestShare(done, profit);
+  if (v.word === 'ahead' && isNum(biggest) && biggest >= ONE_MATCH) v.word = `ahead, one match ${Math.round(biggest * 100)}%`;
+  const beat = rows.filter((r) => isNum(r.beat));
+  // a selection split over two bookmakers, or a stake moved by a day cap, is two (or more) parts but one opinion (Codex's 300
+  // review of 29 Oct 2026, Placeable: 220 parts, 218 selections); where rows carry no `selection` (every other set), each row
+  // already is its own selection, so this stays equal to n
+  const withSel = done.filter((r) => r.selection != null);
+  const selections = withSel.length ? uniq(withSel.map((r) => `${r.day}|${r.selection}`)).length + (n - withSel.length) : n;
+  return {
+    bets: rows.length, n, won, lost: n - won, open: open.length, void: rows.filter((r) => r.status === 'void').length, selections,
+    staked, profit, ret, luck, luckBet, luckMatch, biggest, z: v.z, verdict: v.word, more: v.more,
+    wonPct: n ? won / n : null, needed: n ? mean(done, (r) => r.needs ?? 1 / r.price) : null, said: n ? mean(done, (r) => r.ours) : null,
+    bookp: n ? mean(done, (r) => r.bookp) : null, level: levelRet, levelLuck,
+    openStake: sum(open, (r) => r.stake), avgPrice: n ? mean(done, (r) => r.price) : null, avgEdge: rows.length ? mean(rows, (r) => r.edge) : null,
+    clv: beat.length ? mean(beat, (r) => r.beat) : null, clvN: beat.length, beatShare: beat.length ? beat.filter((r) => r.beat > 0.005).length / beat.length : null,
+    matches: uniq(rows.map((r) => r.match)).length, provisional: done.filter((r) => r.settled_on && !FINAL_SOURCES.has(r.settled_on)).length,
+    ci: wilson(won, n),
+  };
+}
+
+// --------------------------------------------------------------------------------------------- cuts and their order
+
+const ORDER = {
+  pband: ['under 1.30', '1.30 to 1.59', '1.60 to 1.99', '2.00 to 2.49', '2.50 to 3.49', '3.50 and over'],
+  margin: ['very close', 'close', 'far', 'very far'],
+  landed: ['past our number', 'between the line and our number', 'on the wrong side of the line'],
+  nearer: ['our number', 'their number'],
+  score: ['●●●', '●●○', '●○○', 'not scored'],                    // the 1-3 score (confidence retired, 31 Oct 2026)
+  hour: ['before 15:00', '15:00 to 17:59', '18:00 to 20:59', '21:00 and later'],
+  lead: ['under 2 hours', '2 to 6 hours', '6 to 24 hours', 'a day or more'],
+  dow: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'],
+  side: ['over', 'under'],
+  scope: ['home team', 'away team', 'match total'],
+  status: ['won', 'lost', 'open', 'in play', 'void'],
+  round: ['Qualifying', 'Early', 'Middle', 'Late', 'Other'],    // tennis's round groups (tennis_picks.round_group, 4 Nov 2026)
+};
+const leadNum = (s) => { const m = String(s).match(/(-?\d+(\.\d+)?)/); return m ? (/^(under|up to)\b/.test(String(s)) ? -1 + +m[1] / 1000 : +m[1]) : 999; };
+
+export function orderKeys(dim, keys, stats) {
+  if (ORDER[dim]) return [...ORDER[dim].filter((k) => keys.includes(k)), ...keys.filter((k) => !ORDER[dim].includes(k)).sort()];
+  if (dim === 'eband' || dim === 'eband2' || dim === 'sband') return [...keys].sort((a, b) => leadNum(a) - leadNum(b));
+  if (dim === 'day' || dim === 'week') return [...keys].sort();
+  if (stats) return [...keys].sort((a, b) => (stats[b]?.n || 0) - (stats[a]?.n || 0) || String(a).localeCompare(String(b)));
+  return [...keys].sort();
+}
+
+export function valueOf(r, dim) {
+  const v = r[dim];
+  return v === null || v === undefined || v === '' ? '(not known)' : v;
+}
+
+export function group(rows, dim) {
+  const m = new Map();
+  for (const r of rows) {
+    const k = valueOf(r, dim);
+    if (!m.has(k)) m.set(k, []);
+    m.get(k).push(r);
+  }
+  const stats = {};
+  for (const [k, g] of m) stats[k] = { key: k, rows: g, ...agg(g) };
+  return orderKeys(dim, [...m.keys()], stats).map((k) => stats[k]);
+}
+
+export function cross(rows, a, b) {
+  const ga = group(rows, a);
+  const keysB = orderKeys(b, uniq(rows.map((r) => valueOf(r, b))), Object.fromEntries(group(rows, b).map((x) => [x.key, x])));
+  const cells = [];
+  for (const x of ga) for (const y of group(x.rows, b)) cells.push({ a: x.key, b: y.key, ...y });
+  return { rowsKeys: ga.map((x) => x.key), colsKeys: keysB, cells, rowTotals: ga };
+}
+
+export function metricOf(g, metric) {
+  if (!g) return null;
+  switch (metric) {
+    case 'ret': return g.ret;
+    case 'level': return g.level;
+    case 'profit': return g.profit;
+    case 'edge': return isNum(g.wonPct) && isNum(g.needed) ? g.wonPct - g.needed : null;
+    case 'calib': return isNum(g.wonPct) && isNum(g.said) ? g.wonPct - g.said : null;
+    case 'z': return g.z;
+    case 'n': return g.n;
+    default: return g.ret;
+  }
+}
+
+// --------------------------------------------------------------------------------------------- time series
+
+export function byDay(rows) {
+  const m = new Map();
+  for (const r of rows) if (r.day) { if (!m.has(r.day)) m.set(r.day, []); m.get(r.day).push(r); }
+  return [...m.keys()].sort().map((d) => ({ day: d, ...agg(m.get(d)) }));
+}
+
+export function byPeriod(rows, period) {
+  const key = period === 'week' ? (r) => r.week : period === 'month' ? (r) => (r.day ? r.day.slice(0, 7) : null) : (r) => r.day;
+  const m = new Map();
+  for (const r of rows) { const k = key(r); if (!k) continue; if (!m.has(k)) m.set(k, []); m.get(k).push(r); }
+  return [...m.keys()].sort().map((k) => ({ key: k, ...agg(m.get(k)) }));
+}
+
+// the running profit of the settled bets, in kick-off order, with the fall from the highest point so far
+export function running(rows) {
+  const done = rows.filter((r) => r.settled && isNum(r.profit)).sort((a, b) => (a.kickAt?.getTime() || 0) - (b.kickAt?.getTime() || 0) || (a.day || '').localeCompare(b.day || ''));
+  let total = 0, peak = 0, staked = 0, worst = 0;
+  const pts = done.map((r) => {
+    total += r.profit; staked += r.stake || 0; peak = Math.max(peak, total);
+    worst = Math.min(worst, total - peak);
+    return { t: r.kickAt ? r.kickAt.getTime() : null, day: r.day, total, dd: total - peak, staked, r };
+  });
+  return { pts, maxDD: worst, peak, now: total, ddNow: total - peak };
+}
+
+export function streak(days) {
+  let cur = 0, sign = 0, best = 0, worst = 0, run = 0, runSign = 0;
+  for (const d of days) {
+    if (!d.n) continue;
+    const s = d.profit > 0 ? 1 : d.profit < 0 ? -1 : 0;
+    if (s === runSign && s !== 0) run++; else { run = s ? 1 : 0; runSign = s; }
+    if (runSign > 0) best = Math.max(best, run);
+    if (runSign < 0) worst = Math.max(worst, run);
+    cur = run; sign = runSign;
+  }
+  return { current: cur, sign, best, worst };
+}
+
+// --------------------------------------------------------------------------------------------- the model
+
+export const CAL_BINS = [[0, 0.35], [0.35, 0.45], [0.45, 0.55], [0.55, 0.65], [0.65, 0.75], [0.75, 1.01]];
+export function calibration(rows) {
+  const done = rows.filter((r) => r.settled && isNum(r.ours));
+  return CAL_BINS.map(([lo, hi]) => {
+    const g = done.filter((r) => r.ours >= lo && r.ours < hi);
+    const w = g.filter((r) => r.w).length;
+    return { lo, hi, n: g.length, said: mean(g, (r) => r.ours), won: g.length ? w / g.length : null, needed: mean(g, (r) => r.needs ?? 1 / r.price), ci: wilson(w, g.length) };
+  });
+}
+
+// how much of the distance from the bookmaker's number to ours showed up in the counts (scripts/ledger.py shown_up)
+export function shownUp(rows) {
+  let gg = 0, gt = 0;
+  const pairs = [];
+  for (const r of rows) {
+    if (!r.settled || !isNum(r.expected) || !isNum(r.theirs) || !isNum(r.swing) || !r.swing) continue;
+    const got = parseFloat(r.actual);
+    if (!Number.isFinite(got)) continue;
+    const gap = (r.expected - r.theirs) / r.swing, x = (got - r.theirs) / r.swing;
+    if (!gap) continue;
+    gg += gap * gap; gt += gap * x; pairs.push([gap, x]);
+  }
+  if (pairs.length < 2) return { share: null, se: null, n: pairs.length };
+  const share = gt / gg;
+  const resid = sum(pairs, ([g, x]) => (x - share * g) ** 2);
+  return { share, se: Math.sqrt(resid / (pairs.length - 1) / gg), n: pairs.length };
+}
+
+// each settled stat pick as a point: across, how far past the line we put our number; up, how far past the line it came
+export function afterPoints(rows) {
+  const out = [];
+  for (const r of rows) {
+    if (!r.settled || !isNum(r.expected) || !isNum(r.line) || !isNum(r.by) || !isNum(r.swing) || !r.swing) continue;
+    const ours = r.side === 'over' ? r.expected - r.line : r.line - r.expected;
+    out.push({ x: ours / r.swing, y: r.by / r.swing, r });
+  }
+  return out;
+}
+
+export { dowOf };
